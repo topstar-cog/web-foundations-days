@@ -138,15 +138,15 @@ The waiting room limits how many users enter the booking flow at once. The CDN a
 
 ## 6. Preventing Double-Booking
 
-TicketHub must ensure that two customers cannot hold or purchase the same seat at the same time.
+TicketHub must ensure that two customers cannot hold or purchase the same seat at the same time. A simple availability check followed by a separate update is unsafe because concurrent requests may both see the seat as available. This is a race condition.
 
 ### Atomic seat reservation
 
-The application must not rely only on checking whether a seat is available before updating it. Two requests could read the same available status simultaneously. Instead, TicketHub uses an atomic conditional database update inside a transaction.
-
-For example, in PostgreSQL:
+PostgreSQL can use a conditional update to claim a seat only when it is available or its previous hold has expired.
 
 ```sql
+BEGIN;
+
 UPDATE seats
 SET status = 'held',
     hold_user_id = :user_id,
@@ -161,20 +161,26 @@ WHERE id = :seat_id
     )
   )
 RETURNING id;
+
+-- Application checks the returned row:
+-- If one row is returned, create the hold/order record
+-- in the same transaction, then COMMIT.
+-- If no rows are returned, ROLLBACK and return HTTP 409 Conflict.
 ```
+The application must check the result before committing. If one row is returned, it records the corresponding hold or order in the same transaction and commits. If no row is returned, the seat was unavailable or the request did not match the conditions, so the transaction is rolled back. The API returns `409 Conflict`.
 
-The application checks the result:
-
-- If one row is returned, the reservation succeeded. The application records the hold or order within the same transaction and commits.
-- If no row is returned, the seat is unavailable or the request is invalid. The transaction does not create a successful hold, and the API returns an appropriate error, such as `409 Conflict`.
-
-When concurrent requests target the same seat, the database coordinates the updates so that only one request can successfully claim the seat under these conditions.
+When two requests target the same seat, PostgreSQL coordinates concurrent updates. After one transaction claims the seat, the other request must re-evaluate the condition and cannot successfully claim that seat while it remains held or sold. This prevents two successful holds for the same seat.
 
 ### Completing a booking safely
 
-1. Hold the seat for five minutes.
-2. Initiate payment and verify the payment outcome with the provider.
-3. In a database transaction, confirm that
+1. **Create a hold:** Reserve the seat for five minutes and record its expiry time.
+2. **Initiate payment:** Create a pending order and send the payment request to the payment provider.
+3. **Verify payment:** Verify the provider's callback or payment status. Do not trust the customer's browser alone as proof of payment.
+4. **Confirm the order:** In a database transaction, verify that the hold belongs to the customer, has not expired, and is still valid. Update the seat and order to their confirmed or sold/paid states, then commit.
+5. **Handle failures:** If payment fails or the hold expires, mark the order appropriately and release the seat only if the hold still belongs to that order. Use idempotency keys and unique provider references to prevent duplicate payment processing.
+6. **Expire abandoned holds:** A background worker periodically releases expired holds using conditional updates so that it cannot release a seat that has since been claimed by another customer.
+
+Payment processing involves an external service and should not be kept inside a long-running database transaction. If payment succeeds but the booking confirmation fails, the system must reconcile the payment and booking state, retry safely where appropriate, and refund or escalate cases it cannot resolve automatically.
 
 ## 7. Design Trade-offs
 
@@ -189,5 +195,13 @@ A five-minute hold gives customers time to pay, but seats remain unavailable to 
 
 ### Read replicas versus data freshness
 Read replicas reduce the load on the primary database, but replication delays can show outdated seat availability. All final booking decisions must use the primary database.
+
+### User latency versus booking correctness
+
+Checking and updating seats through the primary database adds some latency, especially when many buyers compete for the same seats. However, relying on cached or stale seat availability could lead to double-booking. TicketHub prioritizes correct reservations and uses caching for non-authoritative reads to improve response times.
+
+### Architectural simplicity versus scalability
+
+A waiting room, Redis, read replicas, queues, and background workers help the system handle traffic spikes, but each component adds operational complexity and possible failure points. TicketHub should monitor these components, test recovery procedures, and scale them according to measured demand.
 
 These trade-offs prioritize correct seat allocation while maintaining acceptable performance and fairness during peak demand.
